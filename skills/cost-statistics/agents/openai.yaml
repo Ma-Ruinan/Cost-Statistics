@@ -1,0 +1,4 @@
+interface:
+  display_name: "成本统计报告"
+  short_description: "汇总多个对象的成本统计Excel并生成含表格图表和简短分析的Word报告"
+  default_prompt: "使用 $cost-statistics 汇总指定目录中各对象的过程指标统计Excel，生成成本统计报告。"
