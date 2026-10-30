@@ -11,6 +11,21 @@ import report
 
 
 class ReportTests(unittest.TestCase):
+    def test_split_inputs_produce_same_report_table_and_cover_counts(self):
+        try:font=report.font_path()
+        except aggregate.InputError:self.skipTest('No local CJK font for rendering fixture')
+        with tempfile.TemporaryDirectory() as root:
+            root=Path(root);whole=[];parts=[]
+            for name in ('MobileWork','WorkBuddy','TeleAgent'):
+                path=root/(name+'.xlsx');fixtures.workbook(path,name);whole.append(aggregate.load_workbook(path))
+                for i,indices in enumerate(([0,1],[2])):
+                    p=root/f'{name}-{i}.xlsx';fixtures.fragment(p,path,indices);parts.append(aggregate.load_workbook(p))
+            documents=[]
+            for i,items in enumerate((whole,parts)):
+                output=report.build(aggregate.compare(items),root/str(i)/'report.docx',date='2031-05-04',font=font)
+                with ZipFile(output) as z:documents.append(z.read('word/document.xml'))
+            self.assertEqual(*documents)
+
     def test_report_has_only_requested_metrics_and_no_fixed_batch_content(self):
         try:font=report.font_path()
         except aggregate.InputError:self.skipTest('No local CJK font for rendering fixture')

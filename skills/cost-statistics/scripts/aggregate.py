@@ -1,6 +1,7 @@
 """Read accounting workbooks without Office, modifying neither files nor formulas."""
 import argparse
 import collections
+import copy
 import datetime as dt
 import hashlib
 import json
@@ -39,6 +40,18 @@ def source_name(value):
     if key=='alphadata': return 'AlphaData'
     if key=='deepinsight': return 'DeepInsight'
     return text
+
+
+def object_name(value):
+    text=str(value or '').strip()
+    return {'mobilework':'MobileWork','workbuddy':'WorkBuddy','teleagent':'TeleAgent'}.get(text.casefold(),text)
+
+
+def timestamp(value,epoch):
+    if value in (None,''):return None
+    if finite(value):return (epoch+dt.timedelta(days=value)).isoformat(timespec='milliseconds')
+    try:return dt.datetime.fromisoformat(str(value).replace('Z','+00:00')).isoformat(timespec='milliseconds')
+    except ValueError:raise InputError('无法解析运行时间：'+str(value))
 
 
 def finite(value):
@@ -145,13 +158,14 @@ def load_workbook(path,name=None):
             rid=value(row,rc,'测试ID')
             if not rid or rid in ids:raise InputError('逐次记录缺少或重复测试ID：'+str(rid))
             ids.add(rid);metrics={k:get_metric(row,rc,k,issues) for k in METRICS}
-            begin=value(row,rc,'开始时间');date=None
-            if finite(begin):date=(epoch+dt.timedelta(days=begin)).date().isoformat()
-            elif isinstance(begin,str) and re.match(r'^\d{4}-\d{2}-\d{2}',begin):date=begin[:10]
-            raw.append(dict(key=key,run_id=str(rid),metrics=metrics,date=date))
-    if raw:
+            start=timestamp(value(row,rc,'开始时间'),epoch);end=timestamp(value(row,rc,'结束时间'),epoch)
+            raw.append(dict(key=key,run_id=str(rid),metrics=metrics,date=start[:10] if start else None,
+                start=start,end=end,session_id=str(value(row,rc,'会话ID') or '').strip(),
+                user_message_id=str(value(row,rc,'用户消息ID') or '').strip()))
+    if '逐次记录' in sheets:
         by_task=collections.defaultdict(list)
         for row in raw:by_task[row['key']].append(row)
+        if set(by_task)-tasks.keys():raise InputError('逐次记录中存在任务均值表未列出的题目：'+str(sorted(set(by_task)-tasks.keys())))
         for k,t in tasks.items():
             if len(by_task[k])!=t['attempts']:raise InputError('任务均值与逐次记录的执行次数不一致：'+str(k))
             for metric in METRICS:
@@ -161,8 +175,81 @@ def load_workbook(path,name=None):
                     raise InputError('任务均值与逐次记录不一致：'+str(k)+' '+metric)
     if name is None:
         title=next((str(c['value']) for row in summary[:hi] for c in row.values() if '端侧日志统计' in str(c['value'])),None)
-        name=title.replace('端侧日志统计','').strip() if title else path.stem.replace('_过程指标统计','')
+        name=title.replace('端侧日志统计','').strip() if title else path.stem.split('_过程指标统计')[0]
+    name=object_name(name)
+    if not name:raise InputError('无法识别受测对象，请用--input 对象名=路径指定：'+str(path))
     return dict(name=name,path=str(path),sha256=hashlib.sha256(path.read_bytes()).hexdigest(),tasks=tasks,raw=raw,issues=issues)
+
+
+def merge_workbooks(workbooks):
+    """Union tasks per object before intersection; identify runs by native message IDs."""
+    groups=collections.defaultdict(list);hashes={}
+    for w in workbooks:
+        name=object_name(w['name']);old=hashes.setdefault(w['sha256'],name)
+        if old!=name:raise InputError('同一工作簿被指定为不同对象：'+old+'、'+name)
+        groups[name].append(w)
+    merged=[]
+    priority={'MobileWork':0,'WorkBuddy':1,'TeleAgent':2}
+    for name,items in sorted(groups.items(),key=lambda item:(priority.get(item[0],3),item[0])):
+        unique=[];seen_files={};duplicates=[]
+        for w in items:
+            if w['sha256'] in seen_files:
+                duplicates.append(dict(path=w['path'],duplicate_of=seen_files[w['sha256']]))
+            else:seen_files[w['sha256']]=w['path'];unique.append(w)
+        tasks=collections.defaultdict(list);raw_by_file={};runs=[];identities={};duplicate_runs=0
+        for w in unique:
+            by_task=collections.defaultdict(list);file_ids=set()
+            for r in w['raw']:
+                row=copy.deepcopy(r);row['evidence']=[dict(file=w['path'],run_id=row['run_id'])]
+                stable=(row.get('session_id'),row.get('user_message_id'))
+                if all(stable):
+                    if stable in file_ids:raise InputError('同一工作簿重复列出同一次执行：'+str(stable)+' '+w['path'])
+                    file_ids.add(stable)
+                    if stable in identities:
+                        previous=identities[stable]
+                        if previous['key']!=row['key']:
+                            raise InputError('同一执行被关联到不同题目：'+str(stable))
+                        for field in ('start','end'):
+                            a,b=previous.get(field),row.get(field)
+                            if a is not None and b is not None and a!=b:
+                                raise InputError('同一执行的时间冲突：'+str(stable)+' '+field+' '+w['path'])
+                            if a is None:previous[field]=b
+                        for metric in METRICS:
+                            a,b=previous['metrics'][metric],row['metrics'][metric]
+                            if a is not None and b is not None and not math.isclose(a,b,rel_tol=1e-8,abs_tol=1e-6):
+                                raise InputError('同一执行的指标冲突：'+str(stable)+' '+metric+' '+w['path'])
+                            if a is None:previous['metrics'][metric]=b
+                        previous['date']=previous.get('date') or row.get('date')
+                        previous['evidence'].extend(row['evidence']);duplicate_runs+=1
+                    else:identities[stable]=row;runs.append(row)
+                else:runs.append(row)
+                by_task[row['key']].append(row)
+            raw_by_file[w['path']]=by_task
+            for key,task in w['tasks'].items():tasks[key].append((w,task))
+        by_task=collections.defaultdict(list)
+        for r in runs:by_task[r['key']].append(r)
+        combined={}
+        for key,parts in tasks.items():
+            if len({t['title'] for _,t in parts})!=1:
+                raise InputError('同一对象同号题目名称冲突：'+name+' '+str(key))
+            if len(parts)==1:
+                combined[key]=copy.deepcopy(parts[0][1]);continue
+            for w,task in parts:
+                rows=raw_by_file[w['path']][key]
+                if len(rows)!=task['attempts']:
+                    raise InputError('合并同题多份结果需要完整逐次记录：'+name+' '+str(key)+' '+w['path'])
+                if any(not r.get('session_id') or not r.get('user_message_id') for r in rows):
+                    raise InputError('合并同题多份结果需要会话ID和用户消息ID，测试ID不能用来去重：'+name+' '+str(key)+' '+w['path'])
+            metrics={}
+            for metric in METRICS:
+                values=[r['metrics'][metric] for r in by_task[key] if r['metrics'][metric] is not None]
+                metrics[metric]=statistics.mean(values) if values else None
+            combined[key]=dict(title=parts[0][1]['title'],attempts=len(by_task[key]),metrics=metrics)
+        merged.append(dict(name=name,tasks=combined,raw=runs,
+            sources=[dict(path=w['path'],sha256=w['sha256']) for w in unique],
+            issues=[i for w in unique for i in w['issues']],
+            merge=dict(input_files=len(items),unique_files=len(unique),duplicate_files=duplicates,deduplicated_run_rows=duplicate_runs)))
+    return merged
 
 
 def percentile(values,p):
@@ -172,17 +259,17 @@ def percentile(values,p):
 
 
 def compare(workbooks,focus='MobileWork'):
-    if len(workbooks)<2:raise InputError('至少需要两个受测对象的工作簿')
+    workbooks=merge_workbooks(workbooks)
+    if len(workbooks)<2:raise InputError('至少需要两个不同受测对象的工作簿')
     names=[w['name'] for w in workbooks]
-    if len(set(names))!=len(names):raise InputError('同名对象存在多个文件，请明确选择批次或用--input 对象名=路径指定名称')
-    if len({w['sha256'] for w in workbooks})!=len(workbooks):raise InputError('同一工作簿被重复提供')
     common=set.intersection(*(set(w['tasks']) for w in workbooks))
     if not common:raise InputError('各对象没有共同题目')
     for key in common:
         if len({w['tasks'][key]['title'] for w in workbooks})!=1:raise InputError('同号题目名称冲突：'+str(key))
     eligible={k:sorted(t for t in common if all(w['tasks'][t]['metrics'][k] is not None for w in workbooks)) for k in METRICS}
     eligible['total_tokens']=sorted(t for t in common if all(w['tasks'][t]['metrics'][k] is not None for w in workbooks for k in ('input_tokens','output_tokens')))
-    result=dict(schema_version='1.0',focus=focus if focus in names else names[0],common_tasks=[dict(source=k[0],number=k[1],title=workbooks[0]['tasks'][k]['title']) for k in sorted(common)],objects=[],
+    focus=object_name(focus)
+    result=dict(schema_version='1.1',focus=focus if focus in names else names[0],common_tasks=[dict(source=k[0],number=k[1],title=workbooks[0]['tasks'][k]['title']) for k in sorted(common)],objects=[],
         metric_task_counts={k:len(v) for k,v in eligible.items()})
     for w in workbooks:
         means={k:statistics.mean(w['tasks'][t]['metrics'][k] for t in eligible[k]) if eligible[k] else None for k in METRICS}
@@ -197,13 +284,14 @@ def compare(workbooks,focus='MobileWork'):
             input_per_call=ratio('input_tokens','llm_calls'),tool_error_rate=ratio('tool_errors','tool_calls'),
             dates=sorted({r['date'] for r in raw if r['date']}),
             tasks=[dict(source=k[0],number=k[1],**w['tasks'][k]) for k in sorted(common)],
-            excluded_tasks=[list(k) for k in sorted(set(w['tasks'])-common)],issues=w['issues'],source=w['path'],source_sha256=w['sha256']))
+            excluded_tasks=[list(k) for k in sorted(set(w['tasks'])-common)],issues=w['issues'],sources=w['sources'],merge=w['merge'],
+            runs=[dict(source=r['key'][0],number=r['key'][1],**{k:v for k,v in r.items() if k!='key'}) for r in raw]))
     return result
 
 
 def parser():
     p=argparse.ArgumentParser(description='汇总成本统计Excel；源工作簿只读')
-    p.add_argument('--input-dir');p.add_argument('--input',action='append',default=[],help='文件路径或对象名=文件路径，可重复')
+    p.add_argument('--input-dir',help='递归发现过程指标统计Excel');p.add_argument('--input',action='append',default=[],help='文件路径或对象名=文件路径，可重复；同对象自动合并')
     p.add_argument('--focus',default='MobileWork');p.add_argument('--output',required=True)
     return p
 
@@ -211,10 +299,8 @@ def parser():
 def main():
     args=parser().parse_args();inputs=[]
     if args.input_dir:
-        paths=sorted(p for p in Path(args.input_dir).glob('*.xlsx') if not p.name.startswith('~$'))
-        priority={'MobileWork':0,'WorkBuddy':1,'TeleAgent':2}
-        paths.sort(key=lambda p:(priority.get(p.stem.replace('_过程指标统计',''),3),p.name))
-        inputs.extend((p,None) for p in paths if p.stem.endswith('_过程指标统计'))
+        paths=sorted(p for p in Path(args.input_dir).rglob('*.xlsx') if not p.name.startswith('~$'))
+        inputs.extend((p,None) for p in paths if '_过程指标统计' in p.stem)
     for item in args.input:
         if '=' in item:name,path=item.split('=',1);inputs.append((Path(path),name))
         else:inputs.append((Path(item),None))
